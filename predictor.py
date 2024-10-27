@@ -1,6 +1,6 @@
 import numpy as np
 from openai import OpenAI
-client = OpenAI(api_key="sk-proj-sssOcRxqLs1OgMXmphGKT3BlbkFJGTJS2jCCJMoHednhstwh")
+client = OpenAI()
 import time
 import math
 
@@ -84,7 +84,7 @@ class Predictor:
             # Update saved trajectory
             if len(self.saved_trajectory[agent_name]) >= 5:
                 self.saved_trajectory[agent_name].pop(0)  # Keep only the last five points
-            self.saved_trajectory[agent_name].append(tuple(current_location))
+            self.saved_trajectory[agent_name].append(tuple(current_location[:2]))
             prediction_map[agent_name] = prediction
         return prediction_map
 
