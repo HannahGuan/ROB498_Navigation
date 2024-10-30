@@ -103,7 +103,8 @@ def costs_nb(trajs_x, trajs_y, num_agents, num_pts, tsteps, cost_a1, cost_a2, co
 
 
 @nb.jit(nopython=True, parallel=True)
-def weights_update_nb(all_costs, old_weights, index_table, all_pt_index, num_agents, num_pts):
+def weights_update_nb(all_costs, old_weights, index_table, all_pt_index, num_agents, num_pts, trajs_x, trajs_y,
+    goal_x, goal_y, progress_weight=4, alpha=1):
     weights = old_weights.copy()
     for i in range(num_agents):
         row = index_table[i]
@@ -116,6 +117,19 @@ def weights_update_nb(all_costs, old_weights, index_table, all_pt_index, num_age
                     idx2 = all_pt_index[row[k + 1], l]
                     cost1 += all_costs[idx1, idx2] * weights[row[k + 1], l]
             cost1 /= (num_agents - 1) * num_pts
+            if i == 0:
+    
+                traj_x = trajs_x[idx1]  
+                traj_y = trajs_y[idx1]
+
+                dist_start = np.sqrt((traj_x[0] - goal_x) ** 2 + (traj_y[0] - goal_y) ** 2)
+                dist_end = np.sqrt((traj_x[-1] - goal_x) ** 2 + (traj_y[-1] - goal_y) ** 2)
+
+                progress = dist_end - dist_start
+
+                progress_loss = 1.0 / (1.0 + np.exp(-alpha * progress))
+
+                cost1 += progress_weight * progress_loss
             weights[i, j] = np.exp(-1.0 * cost1)
         weights[i] /= np.mean(weights[i])
     return weights
@@ -140,10 +154,36 @@ def coll_beck(trajs_y, y_min, y_max):
     upper_mask = trajs_y < y_max
     return lower_mask * upper_mask
 
-def brne_nav(xtraj_samples, ytraj_samples, num_agents, tsteps, num_pts, cost_a1, cost_a2, cost_a3, ped_sample_scale, y_min, y_max):
+    
+
+def plot_trajectories(x_traj, y_traj, num_points):
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(10, 10))  # 设置图的大小
+
+    # 遍历所有轨迹并绘制
+    for i in range(num_points):
+        plt.plot(x_traj[i], y_traj[i],color = 'blue')
+
+    for i in range(num_points,x_traj.shape[0]):
+        plt.plot(x_traj[i], y_traj[i],color = 'green')
+
+    # 设置标题和标签
+    plt.title('Visualization of 392 Trajectories')
+    plt.xlabel('X-axis')
+    plt.ylabel('Y-axis')
+
+    # 显示网格
+    plt.grid(True)
+    # 显示图表
+    plt.show()
+
+
+def brne_nav(xtraj_samples, ytraj_samples, num_agents, tsteps, num_pts, cost_a1, cost_a2, cost_a3, ped_sample_scale, y_min, y_max, goal_x, goal_y):
     index_table = get_index_table(num_agents).astype(int)
     all_pt_index = np.arange(num_agents * num_pts).reshape(num_agents, num_pts)
     weights = np.ones((num_agents, num_pts))
+    # plot_trajectories(xtraj_samples,ytraj_samples,num_pts)
     all_costs = costs_nb(xtraj_samples, ytraj_samples, num_agents, num_pts, tsteps, cost_a1, cost_a2, cost_a3)
     # print(f"{num_agents} {num_pts} {tsteps} {cost_a1} {cost_a2} {cost_a3}")
     # print(f"input to coll mask {ytraj_samples[0:num_pts].shape}")
@@ -156,7 +196,8 @@ def brne_nav(xtraj_samples, ytraj_samples, num_agents, tsteps, num_pts, cost_a1,
 
     for iter_num in range(10):
         # print(f"\nWeights {iter_num}\n{weights}")
-        weights = weights_update_nb(all_costs, weights, index_table, all_pt_index, num_agents, num_pts)
+        weights = weights_update_nb(all_costs, weights, index_table, all_pt_index, num_agents, num_pts, xtraj_samples, ytraj_samples,
+    goal_x, goal_y)
 
     # print(f"\nFinal Weights\n{weights}")
 
