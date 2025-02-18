@@ -5,6 +5,7 @@ from params.central_params import create_joystick_params
 from joystick_py.joystick_base import JoystickBase
 from joystick_py.joystick_planner import JoystickWithPlanner, JoystickWithPlannerPosns
 from joystick_py.joystick_random import JoystickRandom
+from joystick_py.joystick_social_force import JoystickSocialForce
 
 
 def run_joystick(J: JoystickBase) -> None:
@@ -70,8 +71,7 @@ if __name__ == "__main__":
 
         J = JoystickRVOwCkpt()
     elif args.algo.lower() == "social_forces":
-        from social_force.joystick_social_force import JoystickSocialForce
-
+        # from social_force.joystick_social_force import JoystickSocialForce
         J = JoystickSocialForce()
     elif args.algo.lower() == "sacadrl":
         from sacadrl.joystick_sacadrl import JoystickSACADRL
