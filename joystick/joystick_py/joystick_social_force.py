@@ -31,8 +31,8 @@ class JoystickSocialForce(JoystickBase):
         self.obstacle_map = None
 
         self.relaxation_time = 0.5    # tau
-        self.desired_speed = 1.3     # typical pedestrian speed (m/s)
-        self.V0 = 2.1                # repulsive strength
+        self.desired_speed = 1.2     # typical pedestrian speed (m/s)
+        self.V0 = 2.5                # repulsive strength
         self.sigma = 0.3             # range parameter for exponential
         self.commands = []
         self.simulator_joystick_update_ratio: int = 1
@@ -68,8 +68,8 @@ class JoystickSocialForce(JoystickBase):
 
         # Create the agent_params with obstacle map turned on, if you like:
         self.agent_params = create_agent_params(
-            with_planner=False,      # we won't do the sampling planner
-            with_obstacle_map=True,  # we do want map info
+            with_planner=True,
+            with_obstacle_map=True,
         )
 
         # Additional param tweaks:
@@ -88,8 +88,8 @@ class JoystickSocialForce(JoystickBase):
         Agent._init_fmm_map(self, params=self.agent_params)
 
         # Initialize system dynamics and planner fields
-        # self.planner = Agent._init_planner(self, params=self.agent_params)
-        # self.vehicle_data = self.planner.empty_data_dict()
+        self.planner = Agent._init_planner(self, params=self.agent_params)
+        self.vehicle_data = self.planner.empty_data_dict()
         self.system_dynamics = Agent._init_system_dynamics(
             self, params=self.agent_params
         )
@@ -247,7 +247,7 @@ class JoystickSocialForce(JoystickBase):
         # This should return a numpy array of shape (3,). Then we can do:
         goal_xy = goal_posn_heading[:2]
         dist = np.linalg.norm(np.array([x_new, y_new]) - goal_xy)
-        print("GOAL DIST: " + str(dist))
+        # print("GOAL DIST: " + str(dist))
         if dist < 0.1:
             if self.joystick_params.use_system_dynamics:
                 # velocity-based: set (v, w) = (0, 0)
@@ -286,9 +286,9 @@ class JoystickSocialForce(JoystickBase):
           - finish_episode() at the end
         """
         super().pre_update()
-        # self.simulator_joystick_update_ratio = int(
-        #     np.floor(self.sim_dt / self.agent_params.joystick_params.dt)
-        # )
+        self.simulator_joystick_update_ratio = int(
+            np.floor(self.sim_dt / self.agent_params.dt)
+        )
         while self.joystick_on:
             self.joystick_sense()
             self.joystick_plan()
