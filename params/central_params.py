@@ -35,7 +35,7 @@ default_config.read(os.path.join(cwd, "params/.default_params.ini"))
 episodes_config = configparser.ConfigParser(
     allow_no_value=True, inline_comment_prefixes=";"
 )
-episodes_config.read(os.path.join(cwd, "params/episode_params_val.ini"))
+episodes_config.read(os.path.join(cwd, "params/episode_total.ini"))
 
 # read params file for prerecorded pedestrian datasets
 dataset_config = configparser.ConfigParser(
