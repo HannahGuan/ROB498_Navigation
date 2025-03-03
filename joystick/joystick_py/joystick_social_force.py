@@ -32,8 +32,9 @@ class JoystickSocialForce(JoystickBase):
 
         self.relaxation_time = 0.5    # tau
         self.desired_speed = 1.2     # typical pedestrian speed (m/s)
-        self.V0 = 2.5                # repulsive strength
-        self.sigma = 0.3             # range parameter for exponential
+        self.V0 = 6.0                # repulsive strength
+        self.sigma = 0.8             # range parameter for exponential
+        self.angle_gain = 1.4
         self.commands = []
         self.simulator_joystick_update_ratio: int = 1
 
@@ -119,8 +120,8 @@ class JoystickSocialForce(JoystickBase):
         )
         # Updating robot speeds (linear and angular) based off simulator data
         if robot_prev is not None:
-            self.robot_v = euclidean_dist2(self.robot_current, robot_prev) / self.sim_dt
-            self.robot_w = (self.robot_current[2] - robot_prev[2]) / self.sim_dt
+            self.robot_v = float(euclidean_dist2(self.robot_current, robot_prev) / self.sim_dt)
+            self.robot_w = float((self.robot_current[2] - robot_prev[2]) / self.sim_dt)
         else:
             self.robot_v = 0
             self.robot_w = 0
@@ -231,7 +232,7 @@ class JoystickSocialForce(JoystickBase):
         new_heading = np.arctan2(v_new_2d[1], v_new_2d[0])
         dtheta = (new_heading - th + np.pi) % (2.0 * np.pi) - np.pi
         v_lin = np.linalg.norm(v_new_2d)
-        w_ang = dtheta / dt
+        w_ang = self.angle_gain* dtheta / dt
 
         # If position-based, we should compute the next (x, y, theta, speed)
         # Basic Euler step: x_new = x + vx*dt, y_new = y + vy*dt
@@ -272,9 +273,25 @@ class JoystickSocialForce(JoystickBase):
         if not self.joystick_on or not self.commands:
             return
 
+        # Helper function to convert numpy scalars to native Python types recursively
+        def to_native(value):
+            if isinstance(value, np.generic):
+                return value.item()
+            elif isinstance(value, (list, tuple)):
+                return type(value)(to_native(x) for x in value)
+            elif isinstance(value, dict):
+                return {k: to_native(v) for k, v in value.items()}
+            return value
+
+        # Convert all command values to native Python types
+        native_commands = [to_native(cmd) for cmd in self.commands]
+        
+        # Ensure send_vel_cmds is a proper bool (in case it might be a numpy type)
+        send_vel_cmds = bool(self.joystick_params.use_system_dynamics)
+
         self.send_cmds(
-            self.commands,
-            send_vel_cmds=self.joystick_params.use_system_dynamics
+            native_commands,
+            send_vel_cmds=send_vel_cmds
         )
         self.commands = []
 

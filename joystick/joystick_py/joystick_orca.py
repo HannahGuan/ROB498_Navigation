@@ -1,4 +1,3 @@
-from random import randint
 from typing import List, Tuple, Optional
 from dotmap import DotMap
 from params.central_params import (
@@ -13,9 +12,9 @@ from trajectory.trajectory import SystemConfig
 from utils.utils import euclidean_dist2
 from objectives.objective_function import ObjectiveFunction
 from objectives.personal_space_cost import PersonalSpaceCost
+from trajectory.trajectory import SystemConfig, Trajectory
 
 import numpy as np
-
 from joystick_py.joystick_base import JoystickBase
 
 class JoystickORCA(JoystickBase):
@@ -26,8 +25,9 @@ class JoystickORCA(JoystickBase):
         super().__init__("ORCAPlanner")
         # Parameters
         self.max_speed = 1.2
+        self.radius_inflation = 0.6
         self.agent_hist = {}
-        self.time_horizon = 2.0  # e.g., how far ahead we plan to avoid collisions
+        self.time_horizon = 0.4  # e.g., how far ahead we plan to avoid collisions
         self.commands = []
 
     def init_obstacle_map(self) -> SBPDMap:
@@ -138,166 +138,250 @@ class JoystickORCA(JoystickBase):
         if dist_goal < 0.05:
             # Stop if near the goal
             new_vel = np.zeros(2, dtype=float)
+            return
         else:
-            # 1) Preferred velocity = direction to goal, up to self.max_speed
-            desired_speed = min(dist_goal, self.max_speed)
-            goal_dir = dir_to_goal / (dist_goal + 1e-9)
-            pref_vel = desired_speed * goal_dir
-
-            # 2) Build ORCA constraints by checking neighbors
-            all_agents = self.sim_state_now.get_all_agents()
-            my_robot = list(self.sim_state_now.get_robots().values())[0]
-            my_radius = my_robot.radius
-
-            # Current velocity in 2D (based on v, w)
-            vx = self.robot_v * np.cos(th)
-            vy = self.robot_v * np.sin(th)
-            my_v = np.array([vx, vy], dtype=float)
-
-            constraints = []  # Will store (normal, boundary_point) half-plane constraints
-
-            
-            for other_key, other_agent in all_agents.items():
-                if other_agent is my_robot:
-                    continue
-                other_pos_h = other_agent.get_current_config().position_and_heading_nk3(
-                    squeeze=True
+            self.meta_flag = False
+            pos_center = np.array([[[x, y]]], dtype=float)  # shape (1,1,2)
+            dist_obst = self.obstacle_map.dist_to_nearest_obs(pos_center)[0, 0]
+            if dist_goal > 1.0 and dist_obst < 0.3:
+            # if True:
+                self.meta_flag = True
+                robot_config = SystemConfig.from_pos3(pos3=(x, y, th), v=0.3)
+                self.planner_data = self.planner.optimize(
+                    robot_config, self.goal_config, sim_state_hist=self.sim_states
                 )
-                other_pos = np.array([other_pos_h[0], other_pos_h[1]], dtype=float)
+                self.commands = Trajectory.new_traj_clip_along_time_axis(
+                    self.planner_data["trajectory"],
+                    # self.agent_params.control_horizon,
+                    10,
+                    repeat_second_to_last_speed=True,
+                )
+                v = self.robot_v
+                x_list = np.array(self.commands._position_nk2[0][:,0])
+                y_list = np.array(self.commands._position_nk2[0][:,1])
+                x_opt_trajs = x_list.copy()
+                y_opt_trajs = y_list.copy()
+                x_list = x_opt_trajs.copy()
+                y_list = y_opt_trajs.copy()
+                v_list = np.sqrt((y_list[1:]-y_list[:-1])**2 + (x_list[1:]-x_list[:-1])**2)/0.1
+                v_list = np.array([v, *v_list])
                 
-                # Current config for this agent at this timestep
-                current_config = other_agent.get_current_config()
+                th_list = np.arctan2(y_list[1:]-y_list[:-1], x_list[1:]-x_list[:-1])
+                th_list = np.array([th, *th_list])
 
-                # Build a key to store its previous config in a dictionary
-                agent_prev_str = other_key + "_prev"
-                # If we have no previous config, initialize it
-                if agent_prev_str not in self.agent_hist:
+                for i in range(1, len(x_list)):
+                    delta_x = x_list[i] - x_list[i - 1]
+                    delta_y = y_list[i] - y_list[i - 1]
+                    distance = np.sqrt(delta_x**2 + delta_y**2)
+
+                    # 计算速度
+                    speed = distance / 0.1
+
+                    # 如果速度超过限制，调整当前点的位置
+                    if speed > 1.2:
+                        # 计算缩放因子
+                        scaling_factor = (1.2 * 0.1) / distance
+                        
+                        # 调整位移
+                        delta_x *= scaling_factor
+                        delta_y *= scaling_factor
+                        
+                        # 更新当前点的坐标
+                        x_list[i] = x_list[i - 1] + delta_x
+                        y_list[i] = y_list[i - 1] + delta_y
+    
+                delta_x = x_list[1:] - x_list[:-1]
+                delta_y = y_list[1:] - y_list[:-1]
+                v_list = np.sqrt(delta_x**2 + delta_y**2) / 0.1
+                v_list = np.array([v, *v_list])
+                self.x_list = x_list.copy()
+                self.y_list = y_list.copy()
+                self.th_list = th_list.copy()
+                self.v_list = v_list.copy()
+            else:
+                # 1) Preferred velocity = direction to goal, up to self.max_speed
+                desired_speed = min(dist_goal, self.max_speed)
+                goal_dir = dir_to_goal / (dist_goal + 1e-9)
+                pref_vel = desired_speed * goal_dir
+
+                # 2) Build ORCA constraints by checking neighbors
+                all_agents = self.sim_state_now.get_all_agents()
+                my_robot = list(self.sim_state_now.get_robots().values())[0]
+                my_radius = my_robot.radius
+
+                # Current velocity in 2D (based on v, w)
+                vx = self.robot_v * np.cos(th)
+                vy = self.robot_v * np.sin(th)
+                my_v = np.array([vx, vy], dtype=float)
+
+                constraints = []  # Will store (normal, boundary_point) half-plane constraints
+
+                for other_key, other_agent in all_agents.items():
+                    if other_agent is my_robot:
+                        continue
+                    other_pos_h = other_agent.get_current_config().position_and_heading_nk3(
+                        squeeze=True
+                    )
+                    other_pos = np.array([other_pos_h[0], other_pos_h[1]], dtype=float)
+                    
+                    # Current config for this agent at this timestep
+                    current_config = other_agent.get_current_config()
+
+                    # Build a key to store its previous config in a dictionary
+                    agent_prev_str = other_key + "_prev"
+                    # If we have no previous config, initialize it
+                    if agent_prev_str not in self.agent_hist:
+                        self.agent_hist[agent_prev_str] = current_config
+
+                    # Extract [x, y, theta] from the current config (shape: (3,))
+                    pos_and_heading_now = current_config.position_and_heading_nk3(squeeze=True)
+                    pos_now = pos_and_heading_now[:2]  # (x, y)
+
+                    # Extract [x, y, theta] from the previous config
+                    prev_config = self.agent_hist[agent_prev_str]
+                    pos_and_heading_prev = prev_config.position_and_heading_nk3(squeeze=True)
+                    pos_prev = pos_and_heading_prev[:2]  # (x, y)
+
+                    # Compute delta time for this step
+                    dt = self.sim_dt
+
+                    # Compute velocities in x, y
+                    vx = (pos_now[0] - pos_prev[0]) / dt
+                    vy = (pos_now[1] - pos_prev[1]) / dt
+
+                    other_vel = np.array([vx, vy], dtype=float)
+                    # print(f"Agent {other_key} velocity = ({vx:.3f}, {vy:.3f})")
+                    # print(f"Agent {other_key} position = ({pos_now[0]:.3f}, {pos_prev[0]:.3f})")
+
+                    # Update the stored "previous config" to the current config
                     self.agent_hist[agent_prev_str] = current_config
 
-                # Extract [x, y, theta] from the current config (shape: (3,))
-                pos_and_heading_now = current_config.position_and_heading_nk3(squeeze=True)
-                pos_now = pos_and_heading_now[:2]  # (x, y)
+                    other_r = other_agent.radius
+                    combined_radius = my_radius + other_r + self.radius_inflation
 
-                # Extract [x, y, theta] from the previous config
-                prev_config = self.agent_hist[agent_prev_str]
-                pos_and_heading_prev = prev_config.position_and_heading_nk3(squeeze=True)
-                pos_prev = pos_and_heading_prev[:2]  # (x, y)
+                    rel_pos = other_pos - np.array([x, y])
+                    dist = np.linalg.norm(rel_pos)
 
-                # Compute delta time for this step
-                dt = self.sim_dt
+                    apex = 0.5 * (my_v + other_vel)
+                    rel_vel = my_v - apex
 
-                # Compute velocities in x, y
-                vx = (pos_now[0] - pos_prev[0]) / dt
-                vy = (pos_now[1] - pos_prev[1]) / dt
-
-                other_vel = np.array([vx, vy], dtype=float)
-                # print(f"Agent {other_key} velocity = ({vx:.3f}, {vy:.3f})")
-                # print(f"Agent {other_key} position = ({pos_now[0]:.3f}, {pos_prev[0]:.3f})")
-
-                # Update the stored "previous config" to the current config
-                self.agent_hist[agent_prev_str] = current_config
-
-                other_r = other_agent.radius
-                combined_radius = my_radius + other_r
-
-                rel_pos = other_pos - np.array([x, y])
-                dist_sq = np.sum(rel_pos**2)
-
-                if dist_sq < (combined_radius + 1e-9) ** 2:
-                    # Overlap or near-overlap => push away
-                    dist_ = np.sqrt(dist_sq) + 1e-9
-                    n = rel_pos / dist_
-                    overlap = combined_radius - dist_
-                    w = overlap * n
-                    boundary_pt = my_v + 0.5 * w
-                    constraints.append((n, boundary_pt))
-                else:
-                    # Check if approaching collision in the time horizon
-                    dist_ = np.sqrt(dist_sq)
-                    n = rel_pos / dist_
-                    v_radial = np.dot(my_v - other_vel, n)
-                    limit = combined_radius / self.time_horizon
-                    approach_dist = v_radial * self.time_horizon
-                    # If we will collide within time_horizon, add constraint
-                    if approach_dist + 1e-9 >= dist_ - combined_radius:
-                        w = (limit - (dist_ / self.time_horizon)) * n
+                    if dist < combined_radius + 1e-3:
+                        # Overlap or near-overlap => push away
+                        n = -rel_pos / (dist + 1e-9)
+                        overlap = combined_radius - dist
+                        w = overlap * n
                         boundary_pt = my_v + 0.5 * w
                         constraints.append((n, boundary_pt))
+                    else:
+                        # Check if approaching collision in the time horizon
+                        n = -rel_pos / (dist + 1e-9)
+                        v_radial = np.dot(rel_vel, n)
+                        limit = combined_radius / self.time_horizon
+                        approach_dist = v_radial * self.time_horizon
+                        # If we will collide within time_horizon, add constraint
+                        if approach_dist + 1e-9 >= dist - combined_radius:
+                            w = (limit - v_radial) * n
+                            boundary_pt = rel_vel + 0.5 * w
+                            boundary_pt = apex + (boundary_pt)
+                            constraints.append((n, boundary_pt))
+                
+                # 3) Apply constraints ("push-out" approach) to the preferred velocity
+                new_vel = pref_vel.copy()
+                for (n, boundary_pt) in constraints:
+                    if np.dot(new_vel - boundary_pt, n) < 0.0:
+                        corr = np.dot(boundary_pt - new_vel, n) * n
+                        new_vel = new_vel + corr
+                # new_vel = pref_vel + orca_solver_python(constraints, self.max_speed, pref_vel)
 
-            # 3) Apply constraints ("push-out" approach) to the preferred velocity
-            new_vel = pref_vel.copy()
-            for (n, boundary_pt) in constraints:
-                if np.dot(new_vel - boundary_pt, n) < 0.0:
-                    # Project new_vel onto boundary
-                    corr = np.dot(boundary_pt - new_vel, n) * n
-                    new_vel = new_vel + corr
+                # 4) Clamp to max_speed
+                speed = np.linalg.norm(new_vel)
+                if speed > self.max_speed:
+                    new_vel = (new_vel / (speed + 1e-9)) * self.max_speed
 
-            # 4) Clamp to max_speed
-            speed = np.linalg.norm(new_vel)
-            if speed > self.max_speed:
-                new_vel = (new_vel / (speed + 1e-9)) * self.max_speed
+            # -- Convert the resulting 2D velocity into (v, w) or (x,y,theta,velocity) --
 
-        # -- Convert the resulting 2D velocity into (v, w) or (x,y,theta,velocity) --
+            if not self.meta_flag:
+                if self.joystick_params.use_system_dynamics:
+                    #
+                    # CASE 1: (v, w) for a differential-drive robot
+                    #
+                    # Let new_vel = (vx, vy) in the world frame
+                    dt = self.sim_dt if self.sim_dt > 1e-9 else 0.1
+                    vx_des, vy_des = new_vel
+                    desired_heading = np.arctan2(vy_des, vx_des) if np.linalg.norm(new_vel) > 1e-9 else th
 
-        if self.joystick_params.use_system_dynamics:
-            #
-            # CASE 1: (v, w) for a differential-drive robot
-            #
-            # Let new_vel = (vx, vy) in the world frame
-            dt = self.sim_dt if self.sim_dt > 1e-9 else 0.1
-            vx_des, vy_des = new_vel
-            desired_heading = np.arctan2(vy_des, vx_des) if np.linalg.norm(new_vel) > 1e-9 else th
+                    # Angular difference
+                    dtheta = desired_heading - th
+                    # Wrap to [-pi, pi]
+                    dtheta = (dtheta + np.pi) % (2.0 * np.pi) - np.pi
 
-            # Angular difference
-            dtheta = desired_heading - th
-            # Wrap to [-pi, pi]
-            dtheta = (dtheta + np.pi) % (2.0 * np.pi) - np.pi
+                    # Example maximum turn rate (could be a parameter)
+                    max_angular_speed = 1.5  # rad/s
+                    w_cmd = np.clip(dtheta / dt, -max_angular_speed, max_angular_speed)
 
-            # Example maximum turn rate (could be a parameter)
-            max_angular_speed = 1.5  # rad/s
-            w_cmd = np.clip(dtheta / dt, -max_angular_speed, max_angular_speed)
+                    # Forward speed is the norm of new_vel, but we can reduce if turning
+                    # For instance, if you want to slow down when angle is large:
+                    #   forward_scale = max(0.0, np.cos(dtheta))
+                    #   v_cmd = speed * forward_scale
+                    # Or you can just pass speed as is:
+                    v_cmd = np.linalg.norm(new_vel)
 
-            # Forward speed is the norm of new_vel, but we can reduce if turning
-            # For instance, if you want to slow down when angle is large:
-            #   forward_scale = max(0.0, np.cos(dtheta))
-            #   v_cmd = speed * forward_scale
-            # Or you can just pass speed as is:
-            v_cmd = np.linalg.norm(new_vel)
+                    self.commands = [(float(v_cmd), float(w_cmd))]
 
-            self.commands = [(float(v_cmd), float(w_cmd))]
+                else:
+                    #
+                    # CASE 2: Position-based command => (x_new, y_new, theta_new, speed)
+                    #
+                    dt = self.sim_dt if self.sim_dt > 1e-9 else 0.1
+                    vx_des, vy_des = new_vel
+                    x_new = x + vx_des * dt
+                    y_new = y + vy_des * dt
 
-        else:
-            #
-            # CASE 2: Position-based command => (x_new, y_new, theta_new, speed)
-            #
-            dt = self.sim_dt if self.sim_dt > 1e-9 else 0.1
-            vx_des, vy_des = new_vel
-            x_new = x + vx_des * dt
-            y_new = y + vy_des * dt
+                    if np.linalg.norm(new_vel) > 1e-9:
+                        th_new = np.arctan2(vy_des, vx_des)
+                    else:
+                        th_new = th
 
-            if np.linalg.norm(new_vel) > 1e-9:
-                th_new = np.arctan2(vy_des, vx_des)
-            else:
-                th_new = th
+                    v_cmd = np.linalg.norm(new_vel)
+                    self.robot_current = np.array([x_new, y_new, th_new], dtype=float)
 
-            v_cmd = np.linalg.norm(new_vel)
-            self.robot_current = np.array([x_new, y_new, th_new], dtype=float)
-
-            self.commands = [(float(x_new), float(y_new), float(th_new), float(v_cmd))]
+                    self.commands = [(float(x_new), float(y_new), float(th_new), float(v_cmd))]
 
 
     def joystick_act(self) -> None:
         """
         Send out the velocity commands as (v, w), similar to joystick_random or planner code.
         """
-        if not self.joystick_on or not self.commands:
-            return
+        if not self.meta_flag:
+            if not self.joystick_on or not self.commands:
+                return
 
-        self.send_cmds(
-            self.commands,
-            send_vel_cmds=self.joystick_params.use_system_dynamics
-        )
-        self.commands = []
+            self.send_cmds(
+                self.commands,
+                send_vel_cmds=self.joystick_params.use_system_dynamics
+            )
+            self.commands = []
+        else:
+            if self.joystick_on:
+                num_cmds_per_step = self.simulator_joystick_update_ratio
+                # runs through the entire planned horizon just with a cmds_step of the above
+                # num_steps = int(np.floor(self.commands.k / num_cmds_per_step))
+                # num_steps = int(np.floor(self.agent_params.control_horizon / num_cmds_per_step))
+                num_steps = 10
+                loop_num = int(num_steps/5)
+                for j in range(loop_num):
+                    xytv_cmds = []
+                    for i in range(num_cmds_per_step):
+                        idx = j * num_cmds_per_step + i
+                        # (x, y, th, v) = self.from_conf(self.commands, idx)
+                        
+                        (x, y, th, v) = float(self.x_list[idx]), float(self.y_list[idx]), float(self.th_list[idx]), float(self.v_list[idx])
+                        xytv_cmds.append((x, y, th, v))
+                    self.send_cmds(xytv_cmds, send_vel_cmds=False)
+
+                    # break if the robot finished
+                    if not self.joystick_on:
+                        break
 
     def update_loop(self) -> None:
         """
