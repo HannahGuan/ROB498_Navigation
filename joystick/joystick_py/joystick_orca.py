@@ -28,6 +28,13 @@ class JoystickORCA(JoystickBase):
         self.radius_inflation = 0.6
         self.agent_hist = {}
         self.time_horizon = 0.4  # e.g., how far ahead we plan to avoid collisions
+
+        # SF Parameters
+        self.relaxation_time = 0.5    # tau
+        self.desired_speed = 1.2     # typical pedestrian speed (m/s)
+        self.V0 = 6.0                # repulsive strength
+        self.sigma = 0.8             # range parameter for exponential
+        self.angle_gain = 1.4
         self.commands = []
 
     def init_obstacle_map(self) -> SBPDMap:
@@ -143,61 +150,130 @@ class JoystickORCA(JoystickBase):
             self.meta_flag = False
             pos_center = np.array([[[x, y]]], dtype=float)  # shape (1,1,2)
             dist_obst = self.obstacle_map.dist_to_nearest_obs(pos_center)[0, 0]
-            if dist_goal > 1.0 and dist_obst < 0.3:
-            # if True:
+            if dist_goal > 1.0 and dist_obst < 0.5:
                 self.meta_flag = True
-                robot_config = SystemConfig.from_pos3(pos3=(x, y, th), v=0.3)
-                self.planner_data = self.planner.optimize(
-                    robot_config, self.goal_config, sim_state_hist=self.sim_states
-                )
-                self.commands = Trajectory.new_traj_clip_along_time_axis(
-                    self.planner_data["trajectory"],
-                    # self.agent_params.control_horizon,
-                    10,
-                    repeat_second_to_last_speed=True,
-                )
-                v = self.robot_v
-                x_list = np.array(self.commands._position_nk2[0][:,0])
-                y_list = np.array(self.commands._position_nk2[0][:,1])
-                x_opt_trajs = x_list.copy()
-                y_opt_trajs = y_list.copy()
-                x_list = x_opt_trajs.copy()
-                y_list = y_opt_trajs.copy()
-                v_list = np.sqrt((y_list[1:]-y_list[:-1])**2 + (x_list[1:]-x_list[:-1])**2)/0.1
-                v_list = np.array([v, *v_list])
                 
-                th_list = np.arctan2(y_list[1:]-y_list[:-1], x_list[1:]-x_list[:-1])
-                th_list = np.array([th, *th_list])
+               # 1) Desired velocity ~ heading to goal:
+                robot_pos = self.robot_current
+                robot_vel = np.array([self.robot_v, self.robot_w])  # or store as full vx, vy
 
-                for i in range(1, len(x_list)):
-                    delta_x = x_list[i] - x_list[i - 1]
-                    delta_y = y_list[i] - y_list[i - 1]
-                    distance = np.sqrt(delta_x**2 + delta_y**2)
+                # Get the final goal from the Episode:
+                goal_xyz = self.current_ep.get_robot_goal()  # [gx, gy, gtheta]
+                # compute direction in 2D
+                goal_dir = goal_xyz[:2] - robot_pos[:2]
+                dist_to_goal = np.linalg.norm(goal_dir)
+                if dist_to_goal > 1e-5:
+                    goal_dir /= dist_to_goal
+                else:
+                    goal_dir = np.array([0., 0.])
 
-                    # 计算速度
-                    speed = distance / 0.1
+                # The "desired" speed could be self.desired_speed or vary with dist_to_goal
+                v_des_2d = goal_dir * self.desired_speed
 
-                    # 如果速度超过限制，调整当前点的位置
-                    if speed > 1.2:
-                        # 计算缩放因子
-                        scaling_factor = (1.2 * 0.1) / distance
-                        
-                        # 调整位移
-                        delta_x *= scaling_factor
-                        delta_y *= scaling_factor
-                        
-                        # 更新当前点的坐标
-                        x_list[i] = x_list[i - 1] + delta_x
-                        y_list[i] = y_list[i - 1] + delta_y
-    
-                delta_x = x_list[1:] - x_list[:-1]
-                delta_y = y_list[1:] - y_list[:-1]
-                v_list = np.sqrt(delta_x**2 + delta_y**2) / 0.1
-                v_list = np.array([v, *v_list])
-                self.x_list = x_list.copy()
-                self.y_list = y_list.copy()
-                self.th_list = th_list.copy()
-                self.v_list = v_list.copy()
+                th = robot_pos[2]
+                v_actual_2d = np.array([self.robot_v * np.cos(th),
+                                        self.robot_v * np.sin(th)])
+                F_desired = (v_des_2d - v_actual_2d) / self.relaxation_time
+
+                # 2) Repulsion from other agents:
+                F_agents = np.zeros(2)
+                all_peds = self.sim_state_now.get_all_agents()
+                # This is your ID in the dictionary:
+                robot_key = list(self.sim_state_now.get_robots().keys())[0]
+                for key, agent in all_peds.items():
+                    if key == robot_key:
+                        continue
+                    pos_other = agent.get_current_config().position_and_heading_nk3(squeeze=True)
+                    diff = robot_pos[:2] - pos_other[:2]
+                    dist = np.linalg.norm(diff)
+                    if dist < 1e-6:
+                        continue
+                    # Helbing’s exponential:
+                    direction = diff / dist
+                    rep_val = self.V0 * np.exp(-dist / self.sigma)
+                    F_agents += rep_val * direction
+
+                # 3) Repulsion from obstacles via self.obstacle_map
+                eps = 0.05
+                x, y = robot_pos[0], robot_pos[1]
+
+                # Distance at the robot's current position:
+                pos_center = np.array([[[x, y]]], dtype=float)  # shape (1,1,2)
+                dist_val = self.obstacle_map.dist_to_nearest_obs(pos_center)[0, 0]
+
+                # Distance at x+eps, x-eps
+                pos_plus_x = np.array([[[x + eps, y]]], dtype=float)
+                pos_minus_x = np.array([[[x - eps, y]]], dtype=float)
+                dist_plus_x = self.obstacle_map.dist_to_nearest_obs(pos_plus_x)[0, 0]
+                dist_minus_x = self.obstacle_map.dist_to_nearest_obs(pos_minus_x)[0, 0]
+                df_dx = (dist_plus_x - dist_minus_x) / (2.0 * eps)
+
+                # Distance at y+eps, y-eps
+                pos_plus_y = np.array([[[x, y + eps]]], dtype=float)
+                pos_minus_y = np.array([[[x, y - eps]]], dtype=float)
+                dist_plus_y = self.obstacle_map.dist_to_nearest_obs(pos_plus_y)[0, 0]
+                dist_minus_y = self.obstacle_map.dist_to_nearest_obs(pos_minus_y)[0, 0]
+                df_dy = (dist_plus_y - dist_minus_y) / (2.0 * eps)
+
+                # Normalize the gradient, if non-zero:
+                grad_d = np.array([df_dx, df_dy], dtype=float)
+                grad_norm = np.linalg.norm(grad_d)
+                if grad_norm > 1e-9:
+                    grad_d /= grad_norm
+
+                # Helbing-style exponential repulsion using nonnegative distance:
+                rep_obs = self.V0 * np.exp(-dist_val / self.sigma)
+                F_walls = rep_obs * grad_d
+
+
+                # 4) Sum the forces:
+                F_total_2d = F_desired + F_agents + F_walls
+
+                # Integrate for dt => new velocity
+                dt = self.sim_dt
+                v_new_2d = v_actual_2d + F_total_2d * dt
+                # clamp speed if needed:
+                max_speed = self.system_dynamics_params.v_bounds[1]
+                speed_new = np.linalg.norm(v_new_2d)
+                if speed_new > max_speed:
+                    v_new_2d *= (max_speed / speed_new)
+
+                # Convert (vx, vy) -> (v_lin, w_ang) for velocity-based or -> (x_new, y_new, th_new, speed_new) for position-based
+                new_heading = np.arctan2(v_new_2d[1], v_new_2d[0])
+                dtheta = (new_heading - th + np.pi) % (2.0 * np.pi) - np.pi
+                v_lin = np.linalg.norm(v_new_2d)
+                w_ang = self.angle_gain* dtheta / dt
+
+                # If position-based, we should compute the next (x, y, theta, speed)
+                # Basic Euler step: x_new = x + vx*dt, y_new = y + vy*dt
+                #   (where vx, vy = v_new_2d)
+                x_new = x + v_new_2d[0] * dt
+                y_new = y + v_new_2d[1] * dt
+                th_new = new_heading
+
+                # Suppose self.goal_config is a SystemConfig.
+                # We'll extract goal [gx, gy, gtheta], or just [gx, gy].
+                goal_posn_heading = self.goal_config.position_and_heading_nk3(squeeze=True)
+                # This should return a numpy array of shape (3,). Then we can do:
+                goal_xy = goal_posn_heading[:2]
+                dist = np.linalg.norm(np.array([x_new, y_new]) - goal_xy)
+                # print("GOAL DIST: " + str(dist))
+                if dist < 0.1:
+                    if self.joystick_params.use_system_dynamics:
+                        # velocity-based: set (v, w) = (0, 0)
+                        self.commands = [(0.0, 0.0)]
+                    else:
+                        # position-based: send the same position
+                        x, y, th = robot_pos
+                        self.commands = [(x, y, th, 0.0)]
+                    return
+
+                if self.joystick_params.use_system_dynamics:
+                    # (v, w)
+                    self.commands = [(float(v_lin), float(w_ang))]
+                else:
+                    # (x, y, theta, velocity)
+                    self.commands = [(float(x_new), float(y_new), float(th_new), float(v_lin))]
             else:
                 # 1) Preferred velocity = direction to goal, up to self.max_speed
                 desired_speed = min(dist_goal, self.max_speed)
@@ -352,36 +428,11 @@ class JoystickORCA(JoystickBase):
         """
         Send out the velocity commands as (v, w), similar to joystick_random or planner code.
         """
-        if not self.meta_flag:
-            if not self.joystick_on or not self.commands:
-                return
-
-            self.send_cmds(
-                self.commands,
-                send_vel_cmds=self.joystick_params.use_system_dynamics
-            )
-            self.commands = []
-        else:
-            if self.joystick_on:
-                num_cmds_per_step = self.simulator_joystick_update_ratio
-                # runs through the entire planned horizon just with a cmds_step of the above
-                # num_steps = int(np.floor(self.commands.k / num_cmds_per_step))
-                # num_steps = int(np.floor(self.agent_params.control_horizon / num_cmds_per_step))
-                num_steps = 10
-                loop_num = int(num_steps/5)
-                for j in range(loop_num):
-                    xytv_cmds = []
-                    for i in range(num_cmds_per_step):
-                        idx = j * num_cmds_per_step + i
-                        # (x, y, th, v) = self.from_conf(self.commands, idx)
-                        
-                        (x, y, th, v) = float(self.x_list[idx]), float(self.y_list[idx]), float(self.th_list[idx]), float(self.v_list[idx])
-                        xytv_cmds.append((x, y, th, v))
-                    self.send_cmds(xytv_cmds, send_vel_cmds=False)
-
-                    # break if the robot finished
-                    if not self.joystick_on:
-                        break
+        self.send_cmds(
+            self.commands,
+            send_vel_cmds=self.joystick_params.use_system_dynamics
+        )
+        self.commands = []
 
     def update_loop(self) -> None:
         """
